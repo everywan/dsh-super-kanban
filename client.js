@@ -1097,7 +1097,57 @@ window.__ModuleLoader__.load({
   "在列表中整理": "Organize in list",
   "跳过 {0} 个闲聊会话": "Skipped {0} small-talk sessions",
   "无效任务状态": "Invalid task status",
-  "来源为插件自动维护会话，已归档": "Source is a plugin's automatic maintenance session; archived"
+  "来源为插件自动维护会话，已归档": "Source is a plugin's automatic maintenance session; archived",
+  "问题 · {0} 待处理": "Issues · {0} open",
+  "问题内容": "Issue text",
+  "严重程度": "Severity",
+  "高": "High",
+  "中": "Medium",
+  "低": "Low",
+  "问题已更新": "Issue updated",
+  "修改": "Edit",
+  "已上移": "Moved up",
+  "上移": "Move up",
+  "已下移": "Moved down",
+  "下移": "Move down",
+  "暂无问题": "No issues",
+  "流程节点已更新": "Stage updated",
+  "已清除流程节点": "Stage cleared",
+  "更新流程节点失败：": "Failed to update the stage: ",
+  "关键事实已更新": "Key facts updated",
+  "扫描进行中，暂时无法分析": "A scan is running; try again later",
+  "分析关键事实失败：{0}": "Failed to analyze key facts: {0}",
+  "流程节点": "Workflow stage",
+  "清除": "Clear",
+  "还没有流程节点，可在看板设置中添加": "No stages yet. Add them in Board settings.",
+  "分析中…": "Analyzing…",
+  "分析关键事实": "Analyze key facts",
+  "操作失败：": "Action failed: ",
+  "任务内部的推进阶段，可增删、重命名和排序。看板四列状态不受影响": "A task's own progress stage; add, rename, reorder or delete them. The four board columns are unaffected.",
+  "节点名称": "Stage name",
+  "节点已重命名": "Stage renamed",
+  "重命名": "Rename",
+  "节点已删除，相关任务已清除该节点": "Stage deleted; tasks that used it were cleared",
+  "确认删除": "Confirm delete",
+  "删除": "Delete",
+  "还没有流程节点": "No stages yet",
+  "节点已添加": "Stage added",
+  "新增流程节点": "New stage",
+  "新增流程节点…": "Add a stage…",
+  "1. 不要输出 keyFacts 或 issues：问题由用户维护，关键事实按需单独提取。": "1. Do not output keyFacts or issues: issues are user-maintained and key facts are extracted on demand.",
+  "你是任务看板的关键事实提取器。输入是一段 DSH（AI 编程助手）会话的紧凑摘要。": "You extract key facts for a task board. The input is a compact digest of a DSH (AI coding assistant) session.",
+  "规则：3-6 条；只写摘要能直接支撑的事实；seq 必须来自摘要中的 [数字]，无法定位时省略该字段；不要复述全篇。": "Rules: 3-6 facts; only facts the digest directly supports; seq must come from a [number] in the digest, omit it when unresolvable; do not restate the whole digest.",
+  "会话摘要：\n{0}\n\n输出 JSON。": "Session digest:\n{0}\n\nOutput JSON.",
+  "请输入流程节点名称": "Enter a stage name",
+  "流程节点不存在": "Stage not found",
+  "流程节点已达上限": "Stage limit reached",
+  "流程节点已存在": "Stage already exists",
+  "流程节点已删除：{0}": "Stage deleted: {0}",
+  "修改问题：{0}": "Edited issue: {0}",
+  "调整问题顺序": "Reordered issues",
+  "按需提取关键事实": "Extracted key facts on demand",
+  "AI 不可用，已用规则提取关键事实": "AI unavailable; key facts extracted by rules",
+  "没有提取到关键事实": "No key facts found"
 });
     const createTranslator = function createTranslator(catalog, language = "en") {
   return function translate(source, values = []) {
@@ -1275,7 +1325,19 @@ window.__ModuleLoader__.load({
       };
     }
 
-    function taskSignal(task, index, now) {
+    /** Workflow stage list (board settings) and the name a task points at. */
+    function stagesOf(settings) {
+      const list = settings?.stages;
+      return Array.isArray(list) ? list : [];
+    }
+
+    function stageNameOf(task, stages) {
+      if (!task?.stageId) return "";
+      const match = (stages || []).find((stage) => stage.id === task.stageId);
+      return match?.name || "";
+    }
+
+    function taskSignal(task, index, now, stages = []) {
       if (task.archived) return null;
       const pending = task.pendingSessions || [];
       if (pending.length === 1) return { label: pending[0].label, text: pending[0].title, rank: 0 };
@@ -1285,13 +1347,18 @@ window.__ModuleLoader__.load({
       const running = task.runningSessions ?? Number(Boolean(task.sessionContext?.isLive));
       const dependency = task.relations?.find((link) => link.type === "depends_on" && index.get(link.taskId)?.status !== "done");
       if (dependency) return { label: t("等待依赖"), text: index.get(dependency.taskId)?.title || t("关联任务不可用"), taskId: dependency.taskId, rank: 1 };
-      const issue = task.issues?.find((item) => item.severity === "high") || task.issues?.[0];
+      // The array order is the user's order: the first issue is the one shown.
+      const issue = task.issues?.[0];
+      const stageName = stageNameOf(task, stages);
       if (!task.sessionContext?.isLive && task.sessionContext?.lastTurnEnd === "error") {
         const sessionId = task.sessionContext.sessionId || task.primarySessionId;
         const failure = task.issues?.find((item) => item.sessionId === sessionId) || (issue?.sessionId ? null : issue);
         return { label: t("执行失败"), text: failure?.text || task.ai?.reason, sessionId, rank: 1 };
       }
-      if (task.status === "blocked" || issue) return { label: t("待处理问题"), text: issue?.text || task.nextSteps?.[0], rank: 1 };
+      // Card next step = stage + first issue. A blocked card without issues shows
+      // the stage instead of pretending there is an unresolved issue.
+      if (task.status === "blocked") return { label: stageName || t("受阻"), text: issue?.text || task.nextSteps?.[0], rank: 1 };
+      if (issue) return { label: stageName || t("待处理问题"), text: issue.text, rank: 1 };
       if (!running && ["review", "acceptance"].includes(task.attention)) {
         const delivery = primaryArtifactOf(artifactsOf(task));
         const deliverable = delivery?.kind === "deliverable" ? delivery : null;
@@ -1393,6 +1460,7 @@ window.__ModuleLoader__.load({
       keyFactText: 60,
       evidenceText: 200,
       evidenceQuote: 160,
+      stageName: 12,
     });
 
     const PRIORITY_META = {
@@ -3016,6 +3084,14 @@ button.sk-task-row-main{cursor:pointer}
 .sk-overview-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .sk-overview-actions .sk-btn[aria-disabled=true]{color:var(--sk-ink-2);cursor:default}
 .sk-overview-steps{margin:6px 0 0;padding-inline-start:18px;color:var(--sk-ink-2);font-size:13px;line-height:1.55;overflow-wrap:anywhere}
+.sk-stage-chips{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.sk-stage-chip{cursor:pointer;height:26px;padding:0 10px;border-radius:999px;border:1px solid var(--sk-line);
+  background:transparent;color:color-mix(in srgb,var(--sk-ink) 65%,transparent);font-size:12px;line-height:1}
+.sk-stage-chip:hover:not(:disabled){background:var(--sk-hover);color:var(--sk-ink);border-color:var(--sk-line-strong)}
+.sk-stage-chip.is-active{background:var(--sk-ink);border-color:var(--sk-ink);color:var(--sk-on-primary);font-weight:520}
+.sk-stage-chip:disabled{opacity:.55;cursor:default}
+.sk-issue-row{flex-wrap:wrap}
+.sk-issue-text{flex:1 1 220px;min-width:0;overflow-wrap:anywhere}
 .sk-ai-review summary{cursor:pointer}
 .sk-ai-review[open] .sk-ai-review-chevron{transform:rotate(90deg)}
 .sk-task-overview .sk-session-actions{margin:0}
@@ -3681,9 +3757,12 @@ button.sk-task-row-main{cursor:pointer}
       const engine = task.ai && task.ai.engine === "llm" ? "AI" : t("规则");
       const showEngine = Boolean(task.ai) || task.origin === "auto" || task.origin === "auto+edited";
       const prioClass = priority === "P0" ? "is-p0" : priority === "P1" ? "is-p1" : "is-rest";
+      const firstIssue = issueList[0]?.text || "";
       const summary = signal && signal.kind !== "due"
         ? [signal.label, signal.text].filter(Boolean).join(" · ")
-        : (!done ? task.nextSteps?.[0] : null);
+        : !done
+          ? [task.stageName, firstIssue || task.nextSteps?.[0]].filter(Boolean).join(" · ") || null
+          : null;
       const running = taskRunningLabel(task);
       return h(
         "article",
@@ -4177,36 +4256,72 @@ button.sk-task-row-main{cursor:pointer}
       );
     }
 
-    function TaskIssues({ task, run, openSourceSession }) {
+    /**
+     * 问题（用户维护）+ 建议下一步（AI 只读）。问题顺序就是数组顺序：上移/下移
+     * 直接改持久化的顺序，卡片上的「第一个问题」也按它显示。扫描不再新增或重排。
+     */
+    function TaskIssues({ task, run, openSourceSession, nextSteps = [] }) {
       const [text, setText] = React.useState("");
-      const [busy, setBusy] = React.useState(false);
-      const severity = { high: 0, medium: 1, low: 2 };
-      const issues = [...(task.issues || [])].sort((a, b) => (severity[a.severity] ?? 9) - (severity[b.severity] ?? 9));
-      const submit = async (value, resolve) => {
-        if (!value.trim() || busy) return;
-        setBusy(true);
+      const [busy, setBusy] = React.useState("");
+      const [editId, setEditId] = React.useState("");
+      const [editText, setEditText] = React.useState("");
+      const [editSeverity, setEditSeverity] = React.useState("medium");
+      const issues = Array.isArray(task.issues) ? task.issues : [];
+      const submit = async (payload, message) => {
+        if (busy) return;
+        setBusy(payload.action || "add");
         try {
           await run(t("更新问题"), async () => {
-            await command("task.issue", { id: task.id, text: value, resolve });
-            if (!resolve) setText("");
-          }, resolve ? t("问题已解决") : t("已记录问题"));
+            await command("task.issue", { id: task.id, ...payload });
+            if (payload.action === "add") setText("");
+            if (payload.action === "edit") setEditId("");
+          }, message);
         } finally {
-          setBusy(false);
+          setBusy("");
         }
       };
-      return h("details", { className: "sk-drawer-sec sk-relation-editor" },
-        h("summary", null, t("问题管理 · {0} 待处理", [issues.length])),
-        issues.map((issue, index) => h("div", { className: "sk-management-row", key: issue.id || index },
-          h("span", null, issue.text),
-          issue.sessionId ? h("button", { className: "sk-text", type: "button", onClick: () => openSourceSession(issue.sessionId) },
-            issue.seq ? t("来源 #{0}", [issue.seq]) : t("打开来源")) : null,
-          h("button", { type: "button", className: "sk-btn", disabled: busy, onClick: () => submit(issue.text, true) }, t("标记解决")))),
-        h("form", { className: "sk-batchbar", onSubmit: (event) => { event.preventDefault(); submit(text, false); } },
+      return h("div", { className: "sk-drawer-sec" },
+        h("div", { className: "sk-drawer-sec-head" },
+          h("span", { className: "sk-drawer-sec-title" }, t("问题 · {0} 待处理", [issues.length])),
+          h("span", { className: "sk-grow" })),
+        issues.length
+          ? issues.map((issue, index) => h("div", { className: "sk-management-row sk-issue-row", key: issue.id || index },
+              editId === issue.id
+                ? h(React.Fragment, null,
+                    h("input", { className: "sk-input", "aria-label": t("问题内容"), maxLength: TEXT_LIMITS.issueText,
+                      value: editText, onChange: (event) => setEditText(event.target.value) }),
+                    h("select", { className: "sk-select", "aria-label": t("严重程度"), value: editSeverity,
+                      onChange: (event) => setEditSeverity(event.target.value) },
+                      h("option", { value: "high" }, t("高")),
+                      h("option", { value: "medium" }, t("中")),
+                      h("option", { value: "low" }, t("低"))),
+                    h("button", { className: "sk-btn", type: "button", disabled: !!busy || !editText.trim(),
+                      onClick: () => submit({ action: "edit", issueId: issue.id, text: editText, severity: editSeverity }, t("问题已更新")) }, t("保存")),
+                    h("button", { className: "sk-text", type: "button", onClick: () => setEditId("") }, t("取消")))
+                : h(React.Fragment, null,
+                    h("span", { className: "sk-issue-text" }, issue.text),
+                    issue.sessionId ? h("button", { className: "sk-text", type: "button", onClick: () => openSourceSession(issue.sessionId) },
+                      issue.seq ? t("来源 #{0}", [issue.seq]) : t("打开来源")) : null,
+                    h("button", { className: "sk-text", type: "button", disabled: !!busy,
+                      onClick: () => { setEditId(issue.id); setEditText(issue.text); setEditSeverity(issue.severity || "medium"); } }, t("修改")),
+                    h("button", { className: "sk-text", type: "button", disabled: !!busy || index === 0,
+                      onClick: () => submit({ action: "move", issueId: issue.id, dir: "up" }, t("已上移")) }, t("上移")),
+                    h("button", { className: "sk-text", type: "button", disabled: !!busy || index === issues.length - 1,
+                      onClick: () => submit({ action: "move", issueId: issue.id, dir: "down" }, t("已下移")) }, t("下移")),
+                    h("button", { className: "sk-btn", type: "button", disabled: !!busy,
+                      onClick: () => submit({ action: "resolve", issueId: issue.id }, t("问题已解决")) }, t("标记解决")))))
+          : h("div", { className: "sk-note-tiny" }, t("暂无问题")),
+        h("form", { className: "sk-batchbar", onSubmit: (event) => { event.preventDefault(); submit({ action: "add", text }, t("已记录问题")); } },
           h("input", { className: "sk-input", "aria-label": t("新增问题"), placeholder: t("记录需要处理的问题"), maxLength: TEXT_LIMITS.issueText,
             value: text, onChange: (event) => setText(event.target.value) }),
-          h("button", { type: "submit", className: "sk-btn", disabled: busy || !text.trim() }, t("添加"))),
+          h("button", { type: "submit", className: "sk-btn", disabled: !!busy || !text.trim() }, t("添加"))),
         task.resolvedIssues?.length ? h("details", null, h("summary", null, t("已解决 {0} 项", [task.resolvedIssues.length])),
-          h("ul", null, task.resolvedIssues.map((issue) => h("li", { key: issue }, issue)))) : null);
+          h("ul", null, task.resolvedIssues.map((issue) => h("li", { key: issue }, issue)))) : null,
+        nextSteps.length
+          ? h("details", { className: "sk-relation-editor" },
+              h("summary", null, t("建议下一步 · {0} 项", [nextSteps.length])),
+              h("ul", { className: "sk-overview-steps" }, nextSteps.map((step, index) => h("li", { key: index }, step))))
+          : null);
     }
 
     function TaskLinks({ task, tasks, host, run, onOpenTask, pushToast }) {
@@ -4402,6 +4517,8 @@ button.sk-task-row-main{cursor:pointer}
       const [confirmDelete, setConfirmDelete] = React.useState(false);
       const editBase = React.useRef(null);
       const [analyzeBusy, setAnalyzeBusy] = React.useState(false);
+      const [stageBusy, setStageBusy] = React.useState(false);
+      const [factsBusy, setFactsBusy] = React.useState(false);
       const dialogRef = React.useRef(null);
       const titleId = React.useId();
 
@@ -4416,6 +4533,7 @@ button.sk-task-row-main{cursor:pointer}
       const accepted = isAccepted(task);
       const canAccept = canAcceptTask(task, primaryArtifact);
       const nextSteps = Array.isArray(task.nextSteps) ? task.nextSteps : [];
+      const stages = stagesOf(settings);
       const aiInfo = aiInfoOf(task);
       // 新旧兼容：有 provider 时显示「provider 显示名 / model」；旧任务只有 model 时保持单模型名样式。
       const aiModelText =
@@ -4534,6 +4652,21 @@ button.sk-task-row-main{cursor:pointer}
           await onChanged();
         } catch (cause) {
           pushToast(label + t("失败：") + cause.message, "error");
+        }
+      };
+
+      const setStage = async (stageId) => {
+        if (stageBusy) return;
+        setStageBusy(true);
+        try {
+          await command("task.update", { id: task.id, patch: { stageId }, lockFields: ["stageId"], expectedUpdatedAt: task.updatedAt });
+          pushToast(stageId ? t("流程节点已更新") : t("已清除流程节点"), "info");
+          await onChanged();
+        } catch (cause) {
+          pushToast(t("更新流程节点失败：") + cause.message, "error");
+          if (cause.status === 409) await onChanged();
+        } finally {
+          setStageBusy(false);
         }
       };
 
@@ -4686,6 +4819,27 @@ button.sk-task-row-main{cursor:pointer}
         }
       };
 
+      // 关键事实不再随扫描生成，需要时单独分析（消耗 1 次 AI 调用，AI 不可用时用规则抽取）。
+      const analyzeFacts = async () => {
+        if (factsBusy) return;
+        setFactsBusy(true);
+        try {
+          const res = await command("task.facts", { id: task.id });
+          const data = (res && res.data) || {};
+          const message = String(data.message || t("关键事实已更新"));
+          const details = [];
+          if (data.engine) details.push(data.engine === "llm" ? t("AI 引擎") : t("规则引擎"));
+          if (Number(data.tokens) > 0) details.push(`${fmtTokens(data.tokens)} tokens`);
+          pushToast(details.length ? `${message} · ${details.join(" · ")}` : message, "info");
+          await onChanged();
+        } catch (cause) {
+          const message = String((cause && cause.message) || cause);
+          pushToast(/扫描/.test(message) ? t("扫描进行中，暂时无法分析") : t("分析关键事实失败：{0}", [message]), "error");
+        } finally {
+          setFactsBusy(false);
+        }
+      };
+
       const drawerMenuItems = [
         { label: task.pinned ? t("取消置顶") : t("置顶任务"), icon: "arrow", run: () => run(t("置顶"), () => command("task.pin", { id: task.id, pinned: !task.pinned }), task.pinned ? t("已取消置顶") : t("已置顶")) },
         { label: t("编辑任务"), icon: "edit", run: () => { resetDraft(); setEditing(true); } },
@@ -4823,17 +4977,6 @@ button.sk-task-row-main{cursor:pointer}
                 : h(
                     React.Fragment,
                     null,
-                    h(
-                      "div",
-                      { className: "sk-summary-line" },
-                      h("span", { className: cx("sk-dot", "is-" + statusOf(task)) }),
-                      h("span", { className: cx("sk-summary-status", "is-" + statusOf(task)) }, STATUS_META[statusOf(task)].label),
-                      h("span", { className: "sk-sep" }, "·"),
-                      h("span", { className: cx("sk-summary-prio", task.priority === "P0" ? "is-p0" : task.priority === "P1" ? "is-p1" : "is-rest") }, task.priority || "P2"),
-                      h("span", { className: "sk-sep" }, "·"),
-                      h("span", { className: "sk-muted" }, taskProgressLabel(task)),
-                      task.completionBasis && task.status === "done" && subtasks.length ? h("span", { className: "sk-muted" }, COMPLETION_LABELS[task.completionBasis]) : null,
-                    ),
                     h("div", { className: "sk-task-overview" },
                       h("div", { className: "sk-overview-item" }, h("h3", null, t("目标")), h("p", null, goal?.text || t("待补充"))),
                       h("div", { className: "sk-overview-item" }, h("h3", null, t("验收条件")), h("p", null, task.acceptanceCriteria || t("待补充"))),
@@ -4846,12 +4989,6 @@ button.sk-task-row-main{cursor:pointer}
                         h("button", { type: "button", className: "sk-text sk-planning-action", onClick: () => editPlanning("notes") }, task.notes ? t("编辑备注") : t("添加备注"))),
                       task.notes ? h("div", { className: "sk-overview-item" }, h("h3", null, t("备注")), h("p", { className: "sk-preserve-lines" }, task.notes)) : null,
                       pending.length ? renderSessionActions(pending, openSourceSession) :
-                        !task.writeOverlap && (signal || nextSteps[0]) ? h("div", { className: "sk-overview-item" },
-                          h("h3", null, signal?.label || t("下一步")),
-                          signal?.taskId && tasks.some((item) => item.id === signal.taskId)
-                            ? h("div", null, h("button", { type: "button", className: "sk-text sk-link-text", onClick: () => onOpenTask(signal.taskId) }, signal.text))
-                            : h("p", null, signal?.text || nextSteps[0] || t("查看任务详情")),
-                          signal?.sessionId ? h("div", null, h("button", { type: "button", className: "sk-text sk-link-text", onClick: () => openSourceSession(signal.sessionId) }, t("打开失败会话"))) : null) : null,
                       task.writeOverlap ? h("div", { className: "sk-overview-item" },
                         h("h3", null, t("可能同时修改")), h("p", null, task.writeOverlap.path),
                         renderSessionActions(task.writeOverlap.sessions.map((item) => ({
@@ -4864,25 +5001,6 @@ button.sk-task-row-main{cursor:pointer}
                       canAccept ? h("div", { className: "sk-overview-actions" },
                         h("button", { type: "button", className: "sk-btn", onClick: acceptTask, "aria-disabled": accepted || acceptBusy,
                           "aria-busy": acceptBusy || undefined }, accepted ? t("已人工验收") : acceptBusy ? t("正在确认…") : t("确认验收"))) : null),
-                    aiInfo
-                      ? h(
-                          "details",
-                          { className: "sk-ai-review" },
-                          h(
-                            "summary",
-                            { className: "sk-ai-review-head" },
-                            h(Icon, { name: "chevron", size: 12, className: "sk-ai-review-chevron" }),
-                            h("span", { className: "sk-ai-review-title" }, analyzeBusy ? t("重新研判中…") : aiInfo.engine === "llm" ? t("AI 研判") : t("规则推断")),
-                            aiModelText
-                              ? h("span", { className: "sk-ai-review-meta sk-ai-review-model", title: aiModelText }, aiModelText)
-                              : null,
-                            aiInfo.engine === "llm" && aiInfo.confidence !== null ? h("span", { className: "sk-ai-review-meta" }, `${aiInfo.confidence}%`) : null,
-                            aiInfo.analyzedAt ? h("span", { className: "sk-ai-review-meta" }, relTime(aiInfo.analyzedAt)) : null,
-                            aiStale ? h("span", { className: "sk-ai-review-stale" }, t("可能已过期")) : null,
-                          ),
-                          h("p", { className: "sk-ai-review-reason is-open" }, aiInfo.reason || t("本次未给出研判理由")),
-                        )
-                      : null,
                   ),
               editing && changes.conflicts.length
                 ? h(DraftConflict, { fields: changes.conflicts, onResolve: rebaseDraft })
@@ -4894,35 +5012,60 @@ button.sk-task-row-main{cursor:pointer}
               h(
                 "div",
                 { className: "sk-drawer-sec-head" },
-                h("span", { className: "sk-drawer-sec-title" }, t("关键事实")),
+                h("span", { className: "sk-drawer-sec-title" }, t("流程节点")),
                 h("span", { className: "sk-grow" }),
-                facts.length > 3 ? h("button", { type: "button", className: "sk-text", onClick: () => setFactsExpanded((value) => !value) }, factsExpanded ? t("收起") : t("展开全部 {0} 条", [facts.length])) : null,
+                task.stageId ? h("button", { type: "button", className: "sk-text", disabled: stageBusy,
+                  onClick: () => setStage(null) }, t("清除")) : null,
               ),
-              facts.length
-                ? h(
-                    "div",
-                    { className: "sk-facts" },
-                    (factsExpanded ? facts : facts.slice(0, 3)).map((fact) => {
-                      const meta = factMeta(fact.kind);
-                      const tone =
-                        fact.kind === "progress"
-                          ? "var(--sk-brand-accent)"
-                          : fact.kind === "issue"
-                            ? "var(--dsw-alias-state-warn-primary,#f59e0b)"
-                            : fact.kind === "artifact"
-                              ? "color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 80%,transparent)"
-                              : "color-mix(in srgb,var(--sk-ink) 45%,transparent)";
-                      return h(
-                        "div",
-                        { key: fact.id, className: "sk-fact" },
-                        h("span", { className: "sk-fact-icon", style: { "--fact-tone": tone } }, h(Icon, { name: meta.icon, size: 14 })),
-                        h("span", { className: "sk-fact-text" }, fact.text),
-                      );
-                    }),
-                  )
-                : h("div", { className: "sk-note-tiny" }, t("暂无关键事实")),
+              stages.length
+                ? h("div", { className: "sk-stage-chips" }, stages.map((stage) => h("button", {
+                    key: stage.id, type: "button", disabled: stageBusy,
+                    className: cx("sk-stage-chip", task.stageId === stage.id && "is-active"),
+                    "aria-pressed": task.stageId === stage.id,
+                    onClick: () => setStage(stage.id === task.stageId ? null : stage.id),
+                  }, stage.name)))
+                : h("div", { className: "sk-note-tiny" }, t("还没有流程节点，可在看板设置中添加")),
+                    h(
+                      "div",
+                      { className: "sk-summary-line" },
+                      h("span", { className: cx("sk-dot", "is-" + statusOf(task)) }),
+                      h("span", { className: cx("sk-summary-status", "is-" + statusOf(task)) }, STATUS_META[statusOf(task)].label),
+                      h("span", { className: "sk-sep" }, "·"),
+                      h("span", { className: cx("sk-summary-prio", task.priority === "P0" ? "is-p0" : task.priority === "P1" ? "is-p1" : "is-rest") }, task.priority || "P2"),
+                      h("span", { className: "sk-sep" }, "·"),
+                      h("span", { className: "sk-muted" }, taskProgressLabel(task)),
+                      task.completionBasis && task.status === "done" && subtasks.length ? h("span", { className: "sk-muted" }, COMPLETION_LABELS[task.completionBasis]) : null,
+                    ),
             ),
-            h(TaskIssues, { task, run, openSourceSession }),
+            h(
+              "div",
+              { className: "sk-drawer-sec" },
+              h(
+                "div",
+                { className: "sk-drawer-sec-head" },
+                h("span", { className: "sk-drawer-sec-title" }, t("会话")),
+                h("span", { className: "sk-grow" }),
+                h("button", { type: "button", className: "sk-text sk-link-text", onClick: openSession, disabled: !session.sessionId }, t("打开")),
+              ),
+              h(
+                "div",
+                { className: "sk-session-line" },
+                h(Icon, { name: "chat", size: 14, className: "sk-session-icon" }),
+                h("span", { className: cx("sk-live-dot", !session.isLive && "off", session.isLive && !task.sessionContext?.estimated && "is-live") }),
+                h("span", { className: "sk-session-title", title: session.title }, session.title || t("未关联会话")),
+              ),
+              h(
+                "div",
+                { className: "sk-session-meta" },
+                h("span", null, pending.find((item) => item.id === session.sessionId)?.label || (session.isLive
+                  ? task.sessionContext?.estimated ? t("可能运行中") : t("会话运行中")
+                  : session.lastTurnEnd === "error" ? t("会话出错") : session.lastTurnEnd === "interrupted" ? t("会话中断") : session.sessionId ? t("会话空闲") : t("未关联"))),
+                session.turnCount ? h("span", null, t("第 {0} 轮", [session.turnCount])) : null,
+                session.todoTotal ? h("span", null, t("待办 {0}/{1}", [session.todoDone, session.todoTotal])) : null,
+                goal && goal.text ? h("span", null, t("目标：") + clip(goal.text, 48)) : null,
+              ),
+            ),
+            h(TaskIssues, { task, run, openSourceSession, nextSteps }),
             h(
               "div",
               { className: "sk-drawer-sec" },
@@ -4961,41 +5104,66 @@ button.sk-task-row-main{cursor:pointer}
                 h("button", { type: "button", className: "sk-text", onClick: addSubtask, disabled: !newSubtask.trim() || subtaskBusy === "add" }, t("添加")),
               ),
             ),
-            nextSteps.length
-              ? h("details", { className: "sk-drawer-sec sk-relation-editor" },
-                  h("summary", null, t("建议下一步 · {0} 项", [nextSteps.length])),
-                  h("ul", { className: "sk-overview-steps" },
-                    nextSteps.map((step, index) => h("li", { key: index }, step))))
-              : null,
+            h(TaskLinks, { task, tasks, host, run, onOpenTask, pushToast }),
             h(
               "div",
               { className: "sk-drawer-sec" },
               h(
                 "div",
                 { className: "sk-drawer-sec-head" },
-                h("span", { className: "sk-drawer-sec-title" }, t("会话")),
+                h("span", { className: "sk-drawer-sec-title" }, t("关键事实")),
                 h("span", { className: "sk-grow" }),
-                h("button", { type: "button", className: "sk-text sk-link-text", onClick: openSession, disabled: !session.sessionId }, t("打开")),
+                facts.length > 3 ? h("button", { type: "button", className: "sk-text", onClick: () => setFactsExpanded((value) => !value) }, factsExpanded ? t("收起") : t("展开全部 {0} 条", [facts.length])) : null,
+                h("button", { type: "button", className: "sk-text", disabled: factsBusy || !session.sessionId, onClick: analyzeFacts },
+                  factsBusy ? t("分析中…") : t("分析关键事实")),
               ),
-              h(
-                "div",
-                { className: "sk-session-line" },
-                h(Icon, { name: "chat", size: 14, className: "sk-session-icon" }),
-                h("span", { className: cx("sk-live-dot", !session.isLive && "off", session.isLive && !task.sessionContext?.estimated && "is-live") }),
-                h("span", { className: "sk-session-title", title: session.title }, session.title || t("未关联会话")),
-              ),
-              h(
-                "div",
-                { className: "sk-session-meta" },
-                h("span", null, pending.find((item) => item.id === session.sessionId)?.label || (session.isLive
-                  ? task.sessionContext?.estimated ? t("可能运行中") : t("会话运行中")
-                  : session.lastTurnEnd === "error" ? t("会话出错") : session.lastTurnEnd === "interrupted" ? t("会话中断") : session.sessionId ? t("会话空闲") : t("未关联"))),
-                session.turnCount ? h("span", null, t("第 {0} 轮", [session.turnCount])) : null,
-                session.todoTotal ? h("span", null, t("待办 {0}/{1}", [session.todoDone, session.todoTotal])) : null,
-                goal && goal.text ? h("span", null, t("目标：") + clip(goal.text, 48)) : null,
-              ),
+              facts.length
+                ? h(
+                    "div",
+                    { className: "sk-facts" },
+                    (factsExpanded ? facts : facts.slice(0, 3)).map((fact) => {
+                      const meta = factMeta(fact.kind);
+                      const tone =
+                        fact.kind === "progress"
+                          ? "var(--sk-brand-accent)"
+                          : fact.kind === "issue"
+                            ? "var(--dsw-alias-state-warn-primary,#f59e0b)"
+                            : fact.kind === "artifact"
+                              ? "color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 80%,transparent)"
+                              : "color-mix(in srgb,var(--sk-ink) 45%,transparent)";
+                      return h(
+                        "div",
+                        { key: fact.id, className: "sk-fact" },
+                        h("span", { className: "sk-fact-icon", style: { "--fact-tone": tone } }, h(Icon, { name: meta.icon, size: 14 })),
+                        h("span", { className: "sk-fact-text" }, fact.text),
+                      );
+                    }),
+                  )
+                : h("div", { className: "sk-note-tiny" }, t("暂无关键事实")),
             ),
-            h(TaskLinks, { task, tasks, host, run, onOpenTask, pushToast }),
+            h(
+              "div",
+              { className: "sk-drawer-sec" },
+                    aiInfo
+                      ? h(
+                          "details",
+                          { className: "sk-ai-review" },
+                          h(
+                            "summary",
+                            { className: "sk-ai-review-head" },
+                            h(Icon, { name: "chevron", size: 12, className: "sk-ai-review-chevron" }),
+                            h("span", { className: "sk-ai-review-title" }, analyzeBusy ? t("重新研判中…") : aiInfo.engine === "llm" ? t("AI 研判") : t("规则推断")),
+                            aiModelText
+                              ? h("span", { className: "sk-ai-review-meta sk-ai-review-model", title: aiModelText }, aiModelText)
+                              : null,
+                            aiInfo.engine === "llm" && aiInfo.confidence !== null ? h("span", { className: "sk-ai-review-meta" }, `${aiInfo.confidence}%`) : null,
+                            aiInfo.analyzedAt ? h("span", { className: "sk-ai-review-meta" }, relTime(aiInfo.analyzedAt)) : null,
+                            aiStale ? h("span", { className: "sk-ai-review-stale" }, t("可能已过期")) : null,
+                          ),
+                          h("p", { className: "sk-ai-review-reason is-open" }, aiInfo.reason || t("本次未给出研判理由")),
+                        )
+                      : null,
+            ),
             otherArtifacts.length
               ? h(
                   "details",
@@ -5383,7 +5551,67 @@ button.sk-task-row-main{cursor:pointer}
             h("button", { className: "sk-btn primary", type: "submit", disabled: !changed || saving }, saving ? t("保存中…") : t("应用模型")))));
     }
 
-    function SettingsModal({ settings, route, modelOpen, onModel, workspaces, prefs, usage, onPrefsChange, onClose, onSave, onScan, pushToast }) {
+    /**
+     * 流程节点管理：整块看板共用一份列表，任务只引用节点 id。
+     * 增删、重命名和排序都立即生效；删除节点会清掉引用它的任务。
+     */
+    function StageEditor({ stages, onRefresh, pushToast }) {
+      const [name, setName] = React.useState("");
+      const [busy, setBusy] = React.useState("");
+      const [editingId, setEditingId] = React.useState("");
+      const [editingName, setEditingName] = React.useState("");
+      const [confirmId, setConfirmId] = React.useState("");
+      const act = async (op, payload, message) => {
+        if (busy) return;
+        setBusy(op);
+        try {
+          await command(op, payload);
+          setEditingId("");
+          setConfirmId("");
+          if (op === "stage.create") setName("");
+          pushToast(message, "info");
+          await onRefresh();
+        } catch (cause) {
+          pushToast(t("操作失败：") + cause.message, "error");
+        } finally {
+          setBusy("");
+        }
+      };
+      return h("div", { className: "sk-settings-block" },
+        h("div", { className: "sk-settings-block-head" },
+          h("div", { className: "label" },
+            h("b", null, t("流程节点")),
+            h("span", null, t("任务内部的推进阶段，可增删、重命名和排序。看板四列状态不受影响")))),
+        stages.length
+          ? stages.map((stage, index) => h("div", { className: "sk-management-row", key: stage.id },
+              editingId === stage.id
+                ? h(React.Fragment, null,
+                    h("input", { className: "sk-input", "aria-label": t("节点名称"), maxLength: TEXT_LIMITS.stageName,
+                      value: editingName, onChange: (event) => setEditingName(event.target.value) }),
+                    h("button", { className: "sk-btn", type: "button", disabled: !!busy || !editingName.trim(),
+                      onClick: () => act("stage.rename", { id: stage.id, name: editingName }, t("节点已重命名")) }, t("保存")),
+                    h("button", { className: "sk-text", type: "button", onClick: () => setEditingId("") }, t("取消")))
+                : h(React.Fragment, null,
+                    h("span", null, stage.name),
+                    h("button", { className: "sk-text", type: "button", disabled: !!busy || index === 0,
+                      onClick: () => act("stage.move", { id: stage.id, index: index - 1 }, t("已上移")) }, t("上移")),
+                    h("button", { className: "sk-text", type: "button", disabled: !!busy || index === stages.length - 1,
+                      onClick: () => act("stage.move", { id: stage.id, index: index + 1 }, t("已下移")) }, t("下移")),
+                    h("button", { className: "sk-text", type: "button", disabled: !!busy,
+                      onClick: () => { setEditingId(stage.id); setEditingName(stage.name); } }, t("重命名")),
+                    h("button", { className: "sk-btn", type: "button", disabled: !!busy,
+                      onClick: () => confirmId === stage.id
+                        ? act("stage.remove", { id: stage.id }, t("节点已删除，相关任务已清除该节点"))
+                        : setConfirmId(stage.id) },
+                      confirmId === stage.id ? t("确认删除") : t("删除")))))
+          : h("div", { className: "sk-note-tiny" }, t("还没有流程节点")),
+        h("form", { className: "sk-batchbar", onSubmit: (event) => { event.preventDefault(); act("stage.create", { name }, t("节点已添加")); } },
+          h("input", { className: "sk-input", "aria-label": t("新增流程节点"), placeholder: t("新增流程节点…"),
+            maxLength: TEXT_LIMITS.stageName, value: name, onChange: (event) => setName(event.target.value) }),
+          h("button", { type: "submit", className: "sk-btn", disabled: !!busy || !name.trim() }, t("添加"))));
+    }
+
+    function SettingsModal({ settings, route, modelOpen, onModel, workspaces, prefs, usage, onPrefsChange, onClose, onSave, onScan, onRefresh, pushToast }) {
       const [draft, setDraft] = React.useState(() => {
         return {
           aiEnabled: settings.aiEnabled !== false,
@@ -5494,6 +5722,8 @@ button.sk-task-row-main{cursor:pointer}
                     h("option", { value: "normal" }, t("标准")), h("option", { value: "large" }, t("大"))),
                   h("label", { className: "sk-settings-check" }, h("input", { type: "checkbox", checked: entryDraft.floatPinned,
                     onChange: (event) => changeEntry({ floatPinned: event.target.checked }) }), t("固定"))))) : null,
+            h("h4", { className: "sk-settings-heading" }, t("流程节点")),
+            h(StageEditor, { stages: stagesOf(settings), onRefresh, pushToast }),
             h("h4", { className: "sk-settings-heading" }, t("AI 与扫描")),
             h(
               "div",
@@ -6113,12 +6343,12 @@ button.sk-task-row-main{cursor:pointer}
       return deliveredAt || timeValue(task.lastActivityAt) || timeValue(task.sessionContext?.lastActivityAt);
     }
 
-    function floatingSummary(tasks, statuses, days, now = Date.now()) {
+    function floatingSummary(tasks, statuses, days, now = Date.now(), stages = []) {
       const projected = tasks.filter((task) => !task.archived).map((task) => withSessionStatus(task, statuses, now));
       const index = new Map(projected.map((task) => [task.id, task]));
       const cutoff = activityCutoff(days, now);
       const rows = projected.filter((task) => !isHistoricalTask(task, cutoff)).map((task) => ({
-        task, signal: taskSignal(task, index, now), artifact: primaryArtifactOf(artifactsOf(task)),
+        task, signal: taskSignal(task, index, now, stages), artifact: primaryArtifactOf(artifactsOf(task)),
       }));
       rows.sort((a, b) => taskActivityAt(b.task) - taskActivityAt(a.task) || a.task.id.localeCompare(b.task.id));
       return {
@@ -6280,10 +6510,15 @@ button.sk-task-row-main{cursor:pointer}
       }, []);
       const tasks = React.useMemo(() => {
         const names = new Map((data?.projects || []).map((project) => [project.id, project.name]));
-        return (data?.tasks || []).map((task) => names.has(task.projectId) ? { ...task, projectName: names.get(task.projectId) } : task);
-      }, [data?.tasks, data?.projects]);
-      const summary = React.useMemo(() => floatingSummary(tasks, sessionStatuses, data?.settings?.initialDays, now),
-        [tasks, sessionStatuses, data?.settings?.initialDays, now]);
+        const stageList = stagesOf(data?.settings);
+        return (data?.tasks || []).map((task) => {
+          const named = names.has(task.projectId) ? { ...task, projectName: names.get(task.projectId) } : task;
+          return { ...named, stageName: stageNameOf(task, stageList) };
+        });
+      }, [data?.tasks, data?.projects, data?.settings]);
+      const stages = stagesOf(data?.settings);
+      const summary = React.useMemo(() => floatingSummary(tasks, sessionStatuses, data?.settings?.initialDays, now, stages),
+        [tasks, sessionStatuses, data?.settings?.initialDays, now, stages]);
       // 当前打开的会话：它自己的待审批卡先收起，切到别的会话再露出来。
       const [currentSessionId, setCurrentSessionId] = React.useState(() => host.currentSession?.() || "");
       const currentSessionGrace = React.useRef(0);
@@ -7598,11 +7833,13 @@ button.sk-task-row-main{cursor:pointer}
             for (const { id } of running) if (!bySession.has(id)) bySession.set(id, overlap);
           }
         }
+        const stageList = stagesOf(data?.settings);
         return list.map((task) => {
           const project = byProject.get(task.projectId);
           const projected = withSessionStatus(project ? { ...task, projectName: project.name } : task, statuses, now);
           const overlap = bySession.get(task.primarySessionId) || task.sessions?.map((session) => bySession.get(session.id)).find(Boolean);
-          return overlap && !task.archived ? { ...projected, writeOverlap: overlap } : projected;
+          const styled = { ...projected, stageName: stageNameOf(task, stageList) };
+          return overlap && !task.archived ? { ...styled, writeOverlap: overlap } : styled;
         });
       }, [data?.tasks, data?.writeOverlaps, ctxProps.sessionStatuses, projects, nowTick]);
       const settings = (data && data.settings) || {};
@@ -7693,12 +7930,13 @@ button.sk-task-row-main{cursor:pointer}
       const signals = React.useMemo(() => {
         const result = new Map();
         const now = Date.now();
+        const stages = stagesOf(data?.settings);
         for (const task of tasks) {
-          const signal = taskSignal(task, taskIndex, now);
+          const signal = taskSignal(task, taskIndex, now, stages);
           if (signal) result.set(task.id, signal);
         }
         return result;
-      }, [tasks, taskIndex, nowTick]);
+      }, [tasks, taskIndex, nowTick, data?.settings]);
       const attentionCount = visible.filter((task) => signals.has(task.id)).length;
       const runningCount = visible.filter(taskRunningLabel).length;
       const emptyProject = selectedProject && !selectedProject.archived &&
@@ -8308,6 +8546,7 @@ button.sk-task-row-main{cursor:pointer}
               onPrefsChange: updatePrefs,
               onClose: () => setSettingsOpen(false),
               onSave: async () => { setSettingsOpen(false); await reload(true); },
+              onRefresh: async () => { await reload(true); },
               onScan: async (mode) => { setSettingsOpen(false); await startScan(mode); },
               pushToast,
             })

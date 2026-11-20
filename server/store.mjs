@@ -55,6 +55,10 @@ export const MILESTONE_LIMIT = 20;
 export const MILESTONE_TEXT_LIMIT = 120;
 export const ARTIFACT_NAME_LIMIT = 80;
 export const EVIDENCE_TEXT_LIMIT = 200;
+/** Workflow stages: a board-level, user-editable list; tasks only reference an id. */
+export const STAGE_LIMIT = 20;
+export const STAGE_NAME_LIMIT = 12;
+export const STAGE_ID_LIMIT = 64;
 
 /** Frozen snapshot of the persisted maxima (exported for docs/client parity). */
 export const TEXT_LIMITS = Object.freeze({
@@ -79,7 +83,43 @@ export const TEXT_LIMITS = Object.freeze({
   evidenceText: EVIDENCE_TEXT_LIMIT,
   evidenceQuote: EVIDENCE_QUOTE_LIMIT,
   artifactName: ARTIFACT_NAME_LIMIT,
+  stageName: STAGE_NAME_LIMIT,
 });
+
+/**
+ * Default workflow stages. Tasks carry `stageId`; the list itself lives in
+ * `settings.stages` and is edited from the board settings (add / rename /
+ * reorder / delete).
+ */
+export const DEFAULT_STAGES = Object.freeze([
+  { id: "st_research", name: "预研" },
+  { id: "st_design", name: "方案" },
+  { id: "st_dev", name: "开发" },
+  { id: "st_selftest", name: "自测" },
+  { id: "st_integration", name: "联调" },
+  { id: "st_release", name: "上线" },
+]);
+
+/**
+ * Sanitize the stage list. A missing/non-array value means "never configured"
+ * and restores the defaults; an explicitly empty array keeps zero stages.
+ */
+export function normalizeStages(value) {
+  if (!Array.isArray(value)) return DEFAULT_STAGES.map((stage) => ({ ...stage }));
+  const seenIds = new Set();
+  const seenNames = new Set();
+  const stages = [];
+  for (const item of value.slice(0, STAGE_LIMIT)) {
+    if (!item || typeof item !== "object") continue;
+    const id = typeof item.id === "string" ? item.id.trim().slice(0, STAGE_ID_LIMIT) : "";
+    const name = clipText(typeof item.name === "string" ? item.name.trim() : "", STAGE_NAME_LIMIT);
+    if (!id || !name || seenIds.has(id) || seenNames.has(name)) continue;
+    seenIds.add(id);
+    seenNames.add(name);
+    stages.push({ id, name });
+  }
+  return stages;
+}
 
 const BACKUP_KEEP = 10;
 
@@ -146,6 +186,8 @@ export const DEFAULT_SETTINGS = {
   aiModel: "",
   /** "auto" = min(due sessions, daily remaining); "fixed" = maxAiCallsPerScan. */
   aiBudgetMode: "auto",
+  // Workflow stages shown on every task (board-level list, user-editable).
+  stages: DEFAULT_STAGES.map((stage) => ({ ...stage })),
 };
 
 /**
@@ -235,7 +277,7 @@ export function createEmptyState() {
     savedAt: new Date().toISOString(),
     tasks: [],
     projects: [],
-    settings: { ...DEFAULT_SETTINGS },
+    settings: { ...DEFAULT_SETTINGS, stages: DEFAULT_STAGES.map((stage) => ({ ...stage })) },
     usage: emptyUsage(),
     ignoredSessions: [],
     suppressedSessions: [], // sessions whose auto task was deleted by the user
@@ -430,8 +472,13 @@ export function truncateTask(task, projectIds) {
   }
   if (Array.isArray(task.issues)) {
     // Filter invalid entries before applying the cap, so junk cannot push real
-    // entries out of the persisted list.
-    task.issues = task.issues.map(normalizeIssueRecord).filter(Boolean).slice(0, ISSUE_LIMIT);
+    // entries out of the persisted list. Older issues carry no id; derive a
+    // stable one from task + text so editing/reordering can address them.
+    task.issues = task.issues
+      .map(normalizeIssueRecord)
+      .filter(Boolean)
+      .slice(0, ISSUE_LIMIT)
+      .map((issue) => issue.id ? issue : { ...issue, id: shortId("i", `${task.id}:${issue.text}`) });
   } else {
     task.issues = [];
   }
@@ -453,6 +500,9 @@ export function truncateTask(task, projectIds) {
     : [];
   task.relations = normalizeRelations(task.relations, task.id);
   task.resolvedIssues = Array.isArray(task.resolvedIssues) ? task.resolvedIssues.filter((item) => typeof item === "string").slice(-50) : [];
+  // Workflow stage: an opaque id into settings.stages; dangling ids are cleared
+  // by stage.remove, and any leftover string is harmless for display.
+  task.stageId = typeof task.stageId === "string" && task.stageId.trim() ? task.stageId.trim().slice(0, STAGE_ID_LIMIT) : null;
   if (typeof task.title === "string") task.title = clipText(task.title, TITLE_TEXT_LIMIT);
   task.acceptanceCriteria = clipText(typeof task.acceptanceCriteria === "string" ? task.acceptanceCriteria.trim() : "", ACCEPTANCE_TEXT_LIMIT);
   if (isRecord(task.goal)) {
@@ -548,6 +598,7 @@ function migrateStateV1V2(raw) {
     state.settings = normalizeAiRoutePair({
       ...DEFAULT_SETTINGS,
       ...normalizeSettingsPatch(raw.settings),
+      stages: normalizeStages(raw.settings.stages),
       lastScanAt: raw.settings.lastScanAt || null,
     });
   }
@@ -602,6 +653,7 @@ export function normalizeSettingsPatch(patch) {
   if (Number.isFinite(Number(patch.dailyAiCallLimit))) {
     result.dailyAiCallLimit = Math.min(500, Math.max(10, Math.round(Number(patch.dailyAiCallLimit))));
   }
+  if (Array.isArray(patch.stages)) result.stages = normalizeStages(patch.stages);
   return result;
 }
 
@@ -758,6 +810,7 @@ export function createStore({ dshHome, logger } = {}) {
       target.settings = normalizeAiRoutePair({
         ...DEFAULT_SETTINGS,
         ...normalizeSettingsPatch(raw.settings),
+        stages: normalizeStages(raw.settings.stages),
         lastScanAt: raw.settings.lastScanAt || null,
       });
     }

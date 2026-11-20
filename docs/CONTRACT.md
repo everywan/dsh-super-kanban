@@ -20,6 +20,9 @@ type Priority = "P0" | "P1" | "P2" | "P3";
 
 看板四列与状态一一对应：待办 / 进行中 / 受阻 / 已完成。
 
+状态（列）与流程节点是两套维度：状态决定卡片在哪一列，流程节点（`stageId`）只描述任务内部推进到哪一步，
+不改变列、不参与筛选。流程节点列表由用户在设置里维护（增删、重命名、排序），见 `settings.stages`。
+
 ## 2. Task 数据模型（v2）
 
 ```jsonc
@@ -31,6 +34,7 @@ type Priority = "P0" | "P1" | "P2" | "P3";
   "progress": 63,                        // 0-100；有 subtasks 时 = round(done/total*100)
   "priority": "P1",
   "tags": ["示例标签"],
+  "stageId": "st_dev",                   // 流程节点 id；引用 settings.stages，未设置为 null
   "origin": "auto",                      // auto | manual | auto+edited
   "workspaceId": "workspace-id",
   "workspaceTitle": "示例工作区",
@@ -39,8 +43,8 @@ type Priority = "P0" | "P1" | "P2" | "P3";
     { "id": "session-...", "title": "来源会话标题", "seqEnd": 128, "evidenceCount": 6 }
   ],
   "primarySessionId": "session-...",
-  "issues": [                            // 问题 / 风险（≤5 条，≤160 字）
-    { "id": "i_x", "text": "问题描述", "severity": "high|medium|low", "sessionId": "session-...", "seq": 210|null }
+  "issues": [                            // 用户维护的问题（≤5 条，≤160 字）；数组顺序即显示顺序
+    { "id": "i_x", "text": "问题描述", "severity": "high|medium|low", "source": "manual", "sessionId": null, "seq": null }
   ],
   "nextSteps": ["下一步动作"],            // ≤5 条，≤160 字
   "milestones": [                        // v1 遗留字段，兼容读取（≤20 条，≤120 字）
@@ -77,7 +81,7 @@ type Priority = "P0" | "P1" | "P2" | "P3";
   ],
 
   // v2 新增字段
-  "keyFacts": [                          // ≤6 条，≤60 字
+  "keyFacts": [                          // ≤6 条，≤60 字；仅在用户点「分析关键事实」时生成
     { "id": "k_x", "text": "关键事实", "kind": "status|progress|issue|decision|artifact|goal",
       "sessionId": "session-...", "seq": 0|null }
   ],
@@ -137,9 +141,10 @@ type Priority = "P0" | "P1" | "P2" | "P3";
 | 字段 | 上限 | 字段 | 上限 |
 | --- | --- | --- | --- |
 | `title` | 80 字 | `goal` | 280 字 |
+| `stageId` | 引用 `settings.stages` 的 id | 流程节点名称 | 12 字 |
 | `acceptanceCriteria` | 600 字 | `notes` | 4000 字 |
 | `tags` | ≤4 个，每个 ≤12 字 | `keyFacts` | ≤6 条，每条 ≤60 字 |
-| `subtasks` | 生成 ≤12 条 / 手动 ≤100 条，每条 ≤60 字 | `issues` | ≤5 条，每条 ≤160 字 |
+| `subtasks` | 生成 ≤12 条 / 手动 ≤100 条，每条 ≤60 字 | `issues` | ≤5 条，每条 ≤160 字（仅用户维护） |
 | `nextSteps` | ≤5 条，每条 ≤160 字 | `milestones` | ≤20 条，每条 ≤120 字 |
 | `evidence` | ≤8 条，`text` ≤200 字、`quote` ≤160 字 | `artifacts` | ≤24 条，`name` ≤80 字 |
 | `history` | ≤20 条 | `sessions` | 任务的来源会话列表（自动任务通常 1 个） |
@@ -217,6 +222,7 @@ type Priority = "P0" | "P1" | "P2" | "P3";
     "initialDays": 30,                       // 近期视图与增量扫描的滚动活跃周期，1–365 天
     "maxTasksPerSession": 3,                // 单会话单次扫描最多产出的自动卡数
     "excludeWorkspaces": [],
+    "stages": [ { "id": "st_research", "name": "预研" } ],  // 流程节点列表（≤20 个，每个名称 ≤12 字）
     "lastScanAt": "ISO|null",
     "maxAiCallsPerScan": 40,                // 默认 40，钳 5–150；仅 aiBudgetMode="fixed" 生效
     "dailyAiCallLimit": 150                 // 每日预算单位上限（10–500，用户本地日历日滚动）；不是硬成本上限
@@ -299,6 +305,8 @@ DSH 模型变更事件可使缓存失效。`?refresh=1` 可主动刷新，距上
 | `task.create` | `{title, goal?, status?, priority?, tags?, workspaceId?, sessionId?, progress?}` | 手动建卡 |
 | `task.update` | `{id, patch: {...}, lockFields?: string[]}` | 用户编辑；`lockFields` 中字段加锁。界面保存标题时会把 `title` 加入锁定，扫描不再覆盖 |
 | `task.move` | `{id, status, index?}` | 拖拽换列 |
+| `task.issue` | `{id, action: "add"\|"edit"\|"move"\|"resolve", issueId?, text?, severity?, index?, dir?}` | 维护问题队列：`add` 追加，`edit` 原位改文案/严重级别，`move` 按 `index` 或 `dir:"up"\|"down"` 排序，`resolve` 移入已解决。旧的 `{text, resolve:true}` 仍兼容；问题只由用户维护，扫描不会增删或重排 |
+| `task.facts` | `{id}` | 按需提取关键事实：只研判主来源会话，最多 1 个预算单位；AI 不可用时用规则抽取。扫描不再自动写 `keyFacts` |
 | `task.archive` | `{id, archived: boolean}` | 归档 / 恢复 |
 | `task.delete` | `{id}` | 删除（自动任务也允许，记入历史） |
 | `task.relink` | `{id, sessionIds: string[]}` | 手动改来源会话（**Host 接口已支持，当前 UI 未暴露**，保留给后续版本） |
@@ -306,6 +314,10 @@ DSH 模型变更事件可使缓存失效。`?refresh=1` 可主动刷新，距上
 | `task.analyze` | `{id}` | 立即重跑研判：**只研判主来源会话**（`primarySessionId`，旧卡回退 `sessions[0]`）；一次最多 1 个预算单位；与扫描 / 其他 AI 命令互斥（见下）；AI 不可用/超预算自动降级规则 |
 | `task.continuePrompt` | `{id, target: "session"\|"newSession", purpose?, sessionId?}` | 本地生成续做草稿，`sessionId` 可指定当前任务的任一关联会话 |
 | `task.accept` | `{id, expectedUpdatedAt?}` | 人工验收并锁定完成状态，同时清空 `review`。归档任务须先恢复，过期修订返回 409 |
+| `stage.create` | `{name, index?}` | 新增流程节点（≤20 个，名称唯一）并返回 `{stages, stage}` |
+| `stage.rename` | `{id, name}` | 重命名流程节点 |
+| `stage.move` | `{id, index}` | 调整流程节点顺序 |
+| `stage.remove` | `{id}` | 删除流程节点，并清空引用它的任务（返回 `cleared`） |
 | `task.polishPrompt` | `{id, prompt}` | AI 润色提示词（耗 1 个预算单位；与扫描 / 其他 AI 命令互斥，见下；不可用时原样返回） |
 | `task.importTodos` | `{id}` | 从来源会话导入待办为子任务 |
 | `task.toggleSubtask` | `{id, subtaskId, done}` | 勾选子任务 |
@@ -319,7 +331,7 @@ DSH 模型变更事件可使缓存失效。`?refresh=1` 可主动刷新，距上
 
 `op` 必须是命令表自身的属性：`"constructor"`、`"__proto__"` 等非自有属性名一律返回 `400 unknown-op`。
 
-扫描与显式 AI 命令（`task.analyze` / `task.polishPrompt`）共享同一个 analyzer 实例，三者互斥：并发请求返回
+扫描与显式 AI 命令（`task.analyze` / `task.facts` / `task.polishPrompt`）共享同一个 analyzer 实例，三者互斥：并发请求返回
 `409 busy`（扫描进行中 →「扫描进行中，请稍后再试」；显式 AI 命令之间 →「其他 AI 任务进行中，请稍后再试」；
 `scan.start` 遇到扫描运行中 →「扫描正在进行中」、遇到显式 AI 命令 →「AI 任务进行中，请稍后再试」），
 并发的自动扫描会顺延到下一 tick。
@@ -334,7 +346,7 @@ DSH 模型变更事件可使缓存失效。`?refresh=1` 可主动刷新，距上
 
 - **只研判主来源会话**：取 `task.primarySessionId`（旧卡 / 重链卡缺失时回退 `task.sessions[0].id`）；无可用会话返回
   `400 task-has-no-session`；主会话日志解析失败返回 `400 session-parse-failed`（显式失败，不再静默规则降级）。
-- **互斥**：与扫描、`task.polishPrompt`、其他 AI 命令共享同一个 analyzer，并发时返回 `409 busy`（见上）；
+- **互斥**：与扫描、`task.facts`、`task.polishPrompt`、其他 AI 命令共享同一个 analyzer，并发时返回 `409 busy`（见上）；
   请求期间自动扫描顺延到下一 tick。
 - 模型按 §5.2 解析。成功后任务的 `ai.provider/model` 记录本次实际使用的模型。
 - **一次 `task.analyze` 最多消耗 1 个预算单位**（一次 analyze，内部重试不重复计）：即使判定「无需建卡」
@@ -386,6 +398,14 @@ DSH 模型变更事件可使缓存失效。`?refresh=1` 可主动刷新，距上
 `Content-Disposition: attachment; filename="super-kanban-YYYYMMDD.json"`，返回完整 state + sessions-cache 摘要（**不含 token / 凭证**）。
 
 > 浏览器半导出时通过 `fetch("/export")` 取回同一份 JSON，另存为 `super-kanban-YYYY-MM-DD.json`（ISO 日期，如 `super-kanban-2026-11-05.json`）；HTTP 头里的文件名只用于直接下载该路由的客户端。
+
+### 流程节点与问题队列
+
+- `settings.stages` 是整块看板共用的一份有序列表，任务用 `stageId` 引用其中一项；默认 预研 / 方案 / 开发 / 自测 / 联调 / 上线。
+- 节点增删、重命名和排序都即时生效；删除节点会把引用它的任务 `stageId` 置空，并写入任务历史。
+- 节点名唯一，最多 20 个；`task.update` 传入不存在的 `stageId` 返回 400（传 `null` 清除）。用户点选阶段会同时锁定 `stageId`。
+- `issues` 只由 `task.issue` 维护，数组顺序就是显示顺序；扫描和研判既不新增、也不重排、也不覆盖已解决的问题。
+- 卡片「下一步」读：阶段名 + 第一条问题（无问题时回退 `nextSteps[0]`）；受阻但没有问题时显示阶段名或「受阻」，不再显示「待处理问题」。
 
 ### 项目与规划字段
 

@@ -2734,3 +2734,95 @@ test("retirement defers when a maintenance session fails to parse", async (t) =>
   assert.equal(after.tasks.length, 1, "card is not retired when its source log fails to parse");
   assert.equal(after.recovery.length, 0);
 });
+
+test("workflow stages: create, rename, reorder and remove clears task references", async (t) => {
+  const { home, service } = await setup(t);
+  const initial = (await request(service, {})).json;
+  assert.equal(initial.settings.stages.length, 6);
+  assert.equal(initial.settings.stages[0].name, "预研");
+
+  const task = (await command(service, "task.create", { title: "带阶段的任务" })).json.data;
+  const added = (await command(service, "stage.create", { name: "灰度", index: 6 })).json.data;
+  assert.equal(added.stages.at(-1).name, "灰度");
+  const stageId = added.stage.id;
+
+  const updated = (await command(service, "task.update", { id: task.id, patch: { stageId }, lockFields: ["stageId"] })).json.data;
+  assert.equal(updated.stageId, stageId);
+  assert.ok(updated.lockedFields.includes("stageId"), "user-picked stages are locked against later AI writes");
+
+  const renamed = (await command(service, "stage.rename", { id: stageId, name: "发布" })).json.data;
+  assert.equal(renamed.stages.at(-1).name, "发布");
+
+  const moved = (await command(service, "stage.move", { id: stageId, index: 0 })).json.data;
+  assert.equal(moved.stages[0].id, stageId);
+
+  const removed = (await command(service, "stage.remove", { id: stageId })).json.data;
+  assert.equal(removed.cleared, 1);
+  assert.ok(!removed.stages.some((stage) => stage.id === stageId));
+  const persisted = readStateFile(home).tasks.find((item) => item.id === task.id);
+  assert.equal(persisted.stageId, null, "deleting a stage clears the tasks that referenced it");
+
+  const bad = await command(service, "task.update", { id: task.id, patch: { stageId: "st_missing" } });
+  assert.equal(bad.status, 400);
+});
+
+test("issues are user-owned: edits, order and resolution survive a rescan", async (t) => {
+  const { home, service } = await setup(t, { withSessions: true });
+  await command(service, "scan.start", { mode: "full" });
+  await waitForScan(service);
+
+  const scanned = readStateFile(home).tasks.find((task) => task.sessions?.some((session) => session.id === "sess-alpha"));
+  assert.ok(scanned, "the seeded session produced a card");
+  assert.deepEqual(scanned.issues, [], "the scan no longer invents issues");
+  assert.deepEqual(scanned.keyFacts, [], "key facts are on demand");
+
+  const add = async (text) => (await command(service, "task.issue", { id: scanned.id, action: "add", text })).json.data;
+  await add("问题一");
+  const withTwo = await add("问题二");
+  const withThree = await add("问题三");
+  assert.deepEqual(withThree.issues.map((issue) => issue.text), ["问题一", "问题二", "问题三"]);
+  const second = withTwo.issues.find((issue) => issue.text === "问题二");
+
+  // Move by id, one step up.
+  const reordered = (await command(service, "task.issue", { id: scanned.id, action: "move", issueId: second.id, dir: "up" }));
+  assert.equal(reordered.status, 200);
+  const afterMove = reordered.json.data;
+  assert.deepEqual(afterMove.issues.map((issue) => issue.text), ["问题二", "问题一", "问题三"]);
+
+  const edited = (await command(service, "task.issue", { id: scanned.id, action: "edit", issueId: second.id, text: "问题二改", severity: "high" })).json.data;
+  assert.equal(edited.issues[0].text, "问题二改");
+  assert.equal(edited.issues[0].severity, "high");
+  assert.equal(edited.issues[0].source, "manual");
+
+  const first = edited.issues.find((issue) => issue.text === "问题一");
+  const resolved = (await command(service, "task.issue", { id: scanned.id, action: "resolve", issueId: first.id })).json.data;
+  assert.deepEqual(resolved.issues.map((issue) => issue.text), ["问题二改", "问题三"]);
+  assert.deepEqual(resolved.resolvedIssues, ["问题一"]);
+
+  await command(service, "scan.start", { mode: "full" });
+  await waitForScan(service);
+  const after = readStateFile(home).tasks.find((task) => task.id === scanned.id);
+  assert.deepEqual(after.issues.map((issue) => issue.text), ["问题二改", "问题三"], "a rescan neither adds nor reorders issues");
+  assert.deepEqual(after.resolvedIssues, ["问题一"]);
+  assert.deepEqual(after.keyFacts, []);
+});
+
+test("task.facts fills key facts on demand with the rules fallback", async (t) => {
+  const { home, service } = await setup(t, { withSessions: true });
+  await command(service, "scan.start", { mode: "full" });
+  await waitForScan(service);
+
+  const card = readStateFile(home).tasks.find((task) => task.sessions?.some((session) => session.id === "sess-alpha"));
+  assert.ok(card);
+  assert.deepEqual(card.keyFacts, [], "the scan does not generate key facts");
+
+  await command(service, "settings.update", { patch: { aiEnabled: false } });
+  const result = await command(service, "task.facts", { id: card.id });
+  assert.equal(result.status, 200);
+  const data = result.json.data;
+  assert.ok(data.task.keyFacts.length > 0, "rules extractor fills the facts");
+  assert.equal(data.engine, "rules");
+  assert.equal(data.task.issues.length, card.issues.length, "facts analysis never touches issues");
+  const persisted = readStateFile(home).tasks.find((task) => task.id === card.id);
+  assert.ok(persisted.keyFacts.length > 0);
+});

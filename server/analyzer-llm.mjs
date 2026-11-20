@@ -48,14 +48,12 @@ function SYSTEM_PROMPT() {
   t("  \"tasks\":[ { \"title\":\"≤40字 动词开头\", \"goal\":\"≤100字 目标/完成标准\","),
   '    "status":"backlog|in_progress|blocked|done", "progress":0, "priority":"P0|P1|P2|P3",',
   t("    \"tags\":[\"≤4个\"],"),
-  t("    \"keyFacts\":[{\"text\":\"≤60字关键事实\",\"kind\":\"status|progress|issue|decision|artifact|goal\",\"seq\":0}],"),
-  t("    \"issues\":[{\"text\":\"≤60字问题/风险\",\"severity\":\"high|medium|low\",\"seq\":0}],"),
   t("    \"nextSteps\":[\"≤60字下一步\"],"),
   t("    \"subtasks\":[{\"text\":\"≤40字子任务\",\"done\":true,\"seq\":0}],"),
   t("    \"evidence\":[{\"seq\":0,\"kind\":\"user|assistant|todo|tool|artifact|error|deliverable\",\"quote\":\"≤80字原文\"}],"),
   t("    \"confidence\":0.0, \"reason\":\"≤120字研判理由\", \"mergeWith\":\"已有任务id或null\" } ] }"),
   t("规则："),
-  t("1. keyFacts 只放 1-5 条最关键事实（状态/进度/问题/决策/产物/目标），不要复述全篇。"),
+  t("1. 不要输出 keyFacts 或 issues：问题由用户维护，关键事实按需单独提取。"),
   t("2. 每任务 evidence ≤5 条，quote 只摘原文短句；seq 必须来自摘要中的 [数字]。"),
   t("3. 默认一个会话只建 1 张卡；只有确实无关的多件事才拆（最多 3 张）。"),
   t("4. 只归纳当前会话的任务；任务关联由用户管理，mergeWith 填 null。"),
@@ -64,6 +62,13 @@ function SYSTEM_PROMPT() {
   t("7. 待办快照可能是很早以前的旧计划，只作参考，不要因旧快照未完成而把已完成任务判成进行中。"),
   t("8. 没有明确用户委托时 ignore=true、tasks=[]。输出必须紧凑完整，确保 JSON 闭合。"),
 ].join("\n");
+}
+
+function FACTS_SYSTEM_PROMPT() {
+  return [
+    t("你是任务看板的关键事实提取器。输入是一段 DSH（AI 编程助手）会话的紧凑摘要。"),
+    t("规则：3-6 条；只写摘要能直接支撑的事实；seq 必须来自摘要中的 [数字]，无法定位时省略该字段；不要复述全篇。"),
+  ].join("\n");
 }
 
 function POLISH_SYSTEM_PROMPT() {
@@ -234,6 +239,41 @@ export function createLlmAnalyzer({ ctx, logger, reserveUnit = () => true } = {}
   }
 
   /**
+   * On-demand key-fact extraction (task.facts). Key facts are no longer part of
+   * the scan prompt, so this is the only LLM path that produces them.
+   */
+  async function facts({ provider, model, digest, signal } = {}) {
+    if (signal?.aborted) return { ok: false, error: "aborted", code: "aborted" };
+    const llm = llmOf(ctx);
+    if (!llm) return { ok: false, error: "llm service unavailable", code: "llm-unavailable" };
+    if (!provider || !model) return { ok: false, error: "provider and model are required", code: "no-route" };
+    if (budget.calls >= budget.limit || !reserveUnit()) return { ok: false, error: "call-budget-exhausted", code: "budget" };
+    budget.calls += 1;
+    budget.attempts += 1;
+    const outcome = await streamOnce({
+      llm,
+      provider,
+      model,
+      system: FACTS_SYSTEM_PROMPT(),
+      messages: [{ role: "user", content: [{ type: "text", text: t("会话摘要：\n{0}\n\n输出 JSON。", [digest]) }] }],
+      signal,
+    });
+    if (!outcome.ok) return { ok: false, error: outcome.message || outcome.code, code: outcome.code };
+    budget.tokens += outcome.usage.totalTokens;
+    const parsed = extractJsonObject(outcome.text);
+    if (!parsed || !Array.isArray(parsed.keyFacts)) {
+      return { ok: false, error: "json-extract-failed", code: "json" };
+    }
+    return {
+      ok: true,
+      keyFacts: parsed.keyFacts.filter((item) => item && typeof item === "object").slice(0, 6),
+      usage: outcome.usage,
+      model,
+      provider,
+    };
+  }
+
+  /**
    * Optional one-shot prompt polish (task.polishPrompt). Counts against the
    * same budget and returns ok:false instead of throwing when unavailable.
    */
@@ -265,6 +305,7 @@ export function createLlmAnalyzer({ ctx, logger, reserveUnit = () => true } = {}
 
   return {
     analyze,
+    facts,
     polish,
     hasService,
     resetBudget: (limit = 40) => {
@@ -275,4 +316,4 @@ export function createLlmAnalyzer({ ctx, logger, reserveUnit = () => true } = {}
   };
 }
 
-export { SYSTEM_PROMPT, POLISH_SYSTEM_PROMPT, TIMEOUT_MS, MAX_OUTPUT_TOKENS };
+export { SYSTEM_PROMPT, POLISH_SYSTEM_PROMPT, FACTS_SYSTEM_PROMPT, TIMEOUT_MS, MAX_OUTPUT_TOKENS };

@@ -6,7 +6,9 @@ import {
   AI_CALLS_PER_SCAN_MAX,
   AI_CALLS_PER_SCAN_MIN,
   DEFAULT_SETTINGS,
+  DEFAULT_STAGES,
   emptyScanState,
+  normalizeStages,
   normalizeAiRoutePair,
   normalizeReviewDeferred,
   normalizeReviewSeen,
@@ -250,4 +252,31 @@ test("the deferred-dismissal ledger drops junk and stays bounded", () => {
   assert.equal(Object.keys(deferred).length, REVIEW_SEEN_LIMIT);
   assert.equal(deferred["session-0"], undefined);
   assert.equal(deferred[`session-${REVIEW_SEEN_LIMIT + 19}`], 1);
+});
+
+test("normalizeStages: defaults, empty list, dedupe and caps", () => {
+  assert.deepEqual(normalizeStages(undefined), DEFAULT_STAGES.map((stage) => ({ ...stage })));
+  assert.deepEqual(normalizeStages("nope"), DEFAULT_STAGES.map((stage) => ({ ...stage })));
+  assert.deepEqual(normalizeStages([]), [], "an explicitly empty list is kept");
+  assert.deepEqual(normalizeStages([
+    { id: "a", name: "  预研  " },
+    { id: "a", name: "重复 id" },
+    { id: "b", name: "预研" },
+    { id: "c", name: "x".repeat(40) },
+    null,
+    { id: "", name: "no id" },
+  ]), [
+    { id: "a", name: "预研" },
+    { id: "c", name: "x".repeat(11) + "…" },
+  ]);
+  assert.equal(normalizeStages(Array.from({ length: 40 }, (_v, index) => ({ id: `s${index}`, name: `n${index}` }))).length, 20);
+});
+
+test("truncateTask keeps a stage id and derives ids for legacy issues", () => {
+  const task = truncateTask({ id: "t_legacy", title: "旧任务", stageId: "  st_dev  ", issues: [{ text: "没有 id 的旧问题" }], nextSteps: [] });
+  assert.equal(task.stageId, "st_dev");
+  assert.match(task.issues[0].id, /^i_/);
+  const again = truncateTask({ id: "t_legacy", title: "旧任务", issues: [{ text: "没有 id 的旧问题" }], nextSteps: [] });
+  assert.equal(again.issues[0].id, task.issues[0].id, "derived ids are stable across loads");
+  assert.equal(truncateTask({ id: "t_x", title: "x", stageId: 12, nextSteps: [] }).stageId, null);
 });

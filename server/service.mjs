@@ -67,6 +67,8 @@ import {
   shortId,
   stableTaskId,
   SUBTASK_LIMIT,
+  STAGE_LIMIT,
+  STAGE_NAME_LIMIT,
   SUBTASK_TEXT_LIMIT,
   TAG_LIMIT,
   TAG_TEXT_LIMIT,
@@ -84,7 +86,7 @@ const AI_ERROR_COOLDOWN_MS = 300_000; // 5 min cooldown for sessions whose analy
 const AI_CATALOG_TTL_MS = 30_000; // GET /ai/models cache
 const AI_CATALOG_TIMEOUT_MS = 12_000; // GET /ai/models and fallback-catalog timeout
 const FIELD_NAMES = ["title", "goal", "status", "progress", "priority", "tags", "issues", "nextSteps", "milestones"];
-const LOCKABLE_FIELDS = [...FIELD_NAMES, "keyFacts", "subtasks", "artifacts", "goalObject"];
+const LOCKABLE_FIELDS = [...FIELD_NAMES, "keyFacts", "subtasks", "artifacts", "goalObject", "stageId"];
 const STATUSES = ["backlog", "in_progress", "blocked", "done"];
 /** Chinese labels for generated prompt text (users read the prompt, not the raw key). */
 const STATUS_LABELS = {
@@ -94,6 +96,7 @@ const STATUS_LABELS = {
   get done() { return t("已完成"); },
 };
 const PRIORITIES = ["P0", "P1", "P2", "P3"];
+const ISSUE_SEVERITIES = ["high", "medium", "low"];
 const SSE_HEARTBEAT_MS = 15_000;
 const SSE_MAX_CLIENTS = 32;
 /** Drop an SSE client whose unread socket buffer exceeds this (backpressure). */
@@ -2462,11 +2465,13 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
       workspacePath: meta.workspacePath || null,
       sessions: [sessionEntryFromMeta(meta, (analysis.evidence || []).length)],
       primarySessionId: meta.id,
-      keyFacts: mergeKeyFacts(analysis.keyFacts || [], []),
+      // Issues and key facts are user-owned: the scanner creates neither.
+      // `task.facts` fills keyFacts on demand; issues come from task.issue.
+      keyFacts: [],
       subtasks,
       artifacts: mergeArtifacts(context.artifacts || [], []),
       sessionContext: context.sessionContext ? { ...context.sessionContext } : null,
-      issues: analysis.issues || [],
+      issues: [],
       nextSteps: analysis.nextSteps || [],
       milestones: analysis.milestones || [],
       evidence: mergeTaskEvidence(analysis.evidence),
@@ -2519,19 +2524,9 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
     if (syncTaskTitleFromSession(task, meta)) otherChanged = true;
     if (setField("priority", PRIORITIES.includes(analysis.priority) ? analysis.priority : undefined)) otherChanged = true;
     if (setField("tags", Array.isArray(analysis.tags) ? analysis.tags.slice(0, TAG_LIMIT) : undefined)) otherChanged = true;
-    const manualIssues = (task.issues || []).filter((issue) => issue.source === "manual");
-    const openIssues = (analysis.issues || []).filter((issue) => !(task.resolvedIssues || []).includes(issueKey(issue)));
-    if (setField("issues", dedupeByText([...manualIssues, ...openIssues], ISSUE_LIMIT))) otherChanged = true;
     if (setField("nextSteps", analysis.nextSteps)) otherChanged = true;
     if (!locked.has("milestones") && Array.isArray(analysis.milestones) && analysis.milestones.length > 0) {
       task.milestones = analysis.milestones;
-    }
-    if (!locked.has("keyFacts") && Array.isArray(analysis.keyFacts) && analysis.keyFacts.length > 0) {
-      const nextFacts = mergeKeyFacts(analysis.keyFacts, (task.keyFacts || []).slice(0, 2));
-      if (JSON.stringify(nextFacts) !== JSON.stringify(task.keyFacts || [])) {
-        task.keyFacts = nextFacts;
-        otherChanged = true;
-      }
     }
 
     if (!locked.has("goal")) {
@@ -2682,12 +2677,32 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
       task.nextSteps,
       task.issues,
       task.milestones,
+      task.stageId,
       task.lockedFields,
     ]);
   }
 
   function normalizedPriority(value, fallback) {
     return PRIORITIES.includes(value) ? value : fallback;
+  }
+
+  /** Clamp an optional list index: missing/invalid means "append"/"end". */
+  function clampIndex(value, max) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return Math.max(0, max);
+    return Math.min(Math.max(0, Math.round(number)), Math.max(0, max));
+  }
+
+  function stageName(value) {
+    const name = clipText(typeof value === "string" ? value.trim() : "", STAGE_NAME_LIMIT);
+    if (!name) throw badRequest(t("请输入流程节点名称"));
+    return name;
+  }
+
+  function requireStage(id) {
+    const stage = (state.settings.stages || []).find((item) => item.id === id);
+    if (!stage) throw notFound(t("流程节点不存在"));
+    return stage;
   }
 
   function workspaceFromPayload(payload) {
@@ -2781,6 +2796,63 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
       return updateProject(project, payload.patch || {});
     },
 
+    /* --------------------------- workflow stages --------------------------- */
+    // Stages are a board-level list in settings.stages; tasks reference one by
+    // id. The list is user-owned: the scanner never invents or renames stages.
+
+    "stage.create"(payload) {
+      const name = stageName(payload.name);
+      const stages = state.settings.stages || [];
+      if (stages.length >= STAGE_LIMIT) throw badRequest(t("流程节点已达上限"));
+      if (stages.some((stage) => stage.name === name)) throw badRequest(t("流程节点已存在"));
+      const stage = { id: shortId("st", `${name}:${Date.now()}`), name };
+      const index = clampIndex(payload.index, stages.length + 1);
+      const next = stages.slice();
+      next.splice(index, 0, stage);
+      state.settings = { ...state.settings, stages: next };
+      return { stages: state.settings.stages, stage };
+    },
+
+    "stage.rename"(payload) {
+      const stage = requireStage(payload.id);
+      const name = stageName(payload.name);
+      if ((state.settings.stages || []).some((item) => item.id !== stage.id && item.name === name)) {
+        throw badRequest(t("流程节点已存在"));
+      }
+      state.settings = {
+        ...state.settings,
+        stages: (state.settings.stages || []).map((item) => item.id === stage.id ? { ...item, name } : item),
+      };
+      return { stages: state.settings.stages };
+    },
+
+    "stage.move"(payload) {
+      const stage = requireStage(payload.id);
+      const stages = (state.settings.stages || []).slice();
+      const from = stages.findIndex((item) => item.id === stage.id);
+      const to = clampIndex(payload.index, stages.length - 1);
+      if (from !== to) {
+        const [moved] = stages.splice(from, 1);
+        stages.splice(to, 0, moved);
+        state.settings = { ...state.settings, stages };
+      }
+      return { stages: state.settings.stages };
+    },
+
+    "stage.remove"(payload) {
+      const stage = requireStage(payload.id);
+      state.settings = { ...state.settings, stages: (state.settings.stages || []).filter((item) => item.id !== stage.id) };
+      let cleared = 0;
+      for (const task of state.tasks) {
+        if (task.stageId !== stage.id) continue;
+        task.stageId = null;
+        cleared += 1;
+        pushHistory(task, { kind: "edit", by: "user", note: t("流程节点已删除：{0}", [stage.name]) });
+        touchTask(task);
+      }
+      return { stages: state.settings.stages, cleared };
+    },
+
     "task.create"(payload) {
       const title = typeof payload.title === "string" ? payload.title.trim() : "";
       if (!title) throw badRequest("title-required");
@@ -2815,6 +2887,7 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
         tags: isStringArray(payload.tags) ? payload.tags.slice(0, TAG_LIMIT).map((tag) => clipText(tag, TAG_TEXT_LIMIT)) : [],
         origin: "manual",
         projectId: projectAssignment(payload.projectId ?? null),
+        stageId: (state.settings.stages || []).some((stage) => stage.id === payload.stageId) ? payload.stageId : null,
         notes: notesText(payload.notes),
         dueDate: planningDate(payload.dueDate ?? null),
         workspaceId: workspace?.id || sessionMeta?.workspaceId || null,
@@ -2875,6 +2948,16 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
         const next = normalize(patch[field]);
         if (task[field] !== next) {
           task[field] = next;
+          otherChanged = true;
+        }
+      }
+      if (Object.hasOwn(patch, "stageId")) {
+        const next = typeof patch.stageId === "string" && patch.stageId.trim() ? patch.stageId.trim() : null;
+        if (next !== null && !(state.settings.stages || []).some((stage) => stage.id === next)) {
+          throw badRequest(t("流程节点不存在"));
+        }
+        if (task.stageId !== next) {
+          task.stageId = next;
           otherChanged = true;
         }
       }
@@ -3155,23 +3238,87 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
       return { count: targets.length };
     },
 
+    // Issues are user-owned since v0.11: the scanner never adds or edits them,
+    // so the array order is the display order. All actions address an issue by
+    // its stable id; the legacy {text, resolve} form keeps old clients working.
     "task.issue"(payload) {
       const task = requireTask(payload);
-      const text = clipText(typeof payload.text === "string" ? payload.text.trim() : "", ISSUE_TEXT_LIMIT);
-      const key = issueKey({ text });
-      if (!key) throw badRequest(t("请输入问题内容"));
-      if (payload.resolve === true) {
-        if (!task.issues.some((issue) => issueKey(issue) === key)) throw notFound(t("问题已变化"));
-        task.resolvedIssues = [...new Set([...(task.resolvedIssues || []), key])].slice(-50);
-        task.issues = task.issues.filter((issue) => issueKey(issue) !== key);
-      } else {
-        if (task.issues.some((issue) => issueKey(issue) === key)) throw badRequest(t("问题已存在"));
-        if (task.issues.length >= ISSUE_LIMIT) throw badRequest(t("待处理问题已达上限"));
+      const issues = Array.isArray(task.issues) ? task.issues : [];
+      const byId = (id) => issues.find((issue) => issue.id === id);
+      const byText = (text) => issues.find((issue) => issueKey(issue) === issueKey({ text }));
+      const target = () => {
+        if (typeof payload.issueId === "string" && payload.issueId) {
+          const found = byId(payload.issueId);
+          if (!found) throw notFound(t("问题已变化"));
+          return found;
+        }
+        const found = byText(payload.text);
+        if (!found) throw notFound(t("问题已变化"));
+        return found;
+      };
+      const action = payload.action === "resolve" || payload.resolve === true
+        ? "resolve"
+        : payload.action === "edit" ? "edit" : payload.action === "move" ? "move" : "add";
+
+      if (action === "add") {
+        const text = clipText(typeof payload.text === "string" ? payload.text.trim() : "", ISSUE_TEXT_LIMIT);
+        const key = issueKey({ text });
+        if (!key) throw badRequest(t("请输入问题内容"));
+        if (issues.some((issue) => issueKey(issue) === key)) throw badRequest(t("问题已存在"));
+        if (issues.length >= ISSUE_LIMIT) throw badRequest(t("待处理问题已达上限"));
+        const severity = ISSUE_SEVERITIES.includes(payload.severity) ? payload.severity : "medium";
+        const issue = { id: shortId("i", `${task.id}:${key}`), text, severity, source: "manual", sessionId: null, seq: null };
+        if (typeof payload.index === "number") {
+          const next = issues.slice();
+          next.splice(clampIndex(payload.index, next.length), 0, issue);
+          task.issues = next;
+        } else {
+          task.issues = [...issues, issue];
+        }
         task.resolvedIssues = (task.resolvedIssues || []).filter((item) => item !== key);
-        task.issues.push({ text, severity: "medium", source: "manual", sessionId: null, seq: null });
+        touchTask(task);
+        pushHistory(task, { kind: "edit", by: "user", note: t("新增问题：{0}", [text]) });
+        return task;
       }
-      touchTask(task);
-      pushHistory(task, { kind: "edit", by: "user", note: payload.resolve ? t("解决问题：{0}", [text]) : t("新增问题：{0}", [text]) });
+
+      const issue = target();
+
+      if (action === "resolve") {
+        task.resolvedIssues = [...new Set([...(task.resolvedIssues || []), issueKey(issue)])].slice(-50);
+        task.issues = issues.filter((item) => item !== issue);
+        touchTask(task);
+        pushHistory(task, { kind: "edit", by: "user", note: t("解决问题：{0}", [issue.text]) });
+        return task;
+      }
+
+      if (action === "edit") {
+        const text = clipText(typeof payload.text === "string" ? payload.text.trim() : "", ISSUE_TEXT_LIMIT);
+        if (!text) throw badRequest(t("请输入问题内容"));
+        const key = issueKey({ text });
+        if (issues.some((item) => item !== issue && issueKey(item) === key)) throw badRequest(t("问题已存在"));
+        const severity = ISSUE_SEVERITIES.includes(payload.severity) ? payload.severity : issue.severity;
+        task.issues = issues.map((item) => item === issue
+          ? { ...item, text, severity, source: "manual", sessionId: null, seq: null }
+          : item);
+        touchTask(task);
+        pushHistory(task, { kind: "edit", by: "user", note: t("修改问题：{0}", [text]) });
+        return task;
+      }
+
+      // move: index wins; otherwise a one-step up/down keeps the UI simple.
+      const from = issues.indexOf(issue);
+      const to = typeof payload.index === "number"
+        ? clampIndex(payload.index, issues.length - 1)
+        : payload.dir === "up" ? Math.max(0, from - 1)
+          : payload.dir === "down" ? Math.min(issues.length - 1, from + 1) : from;
+      if (to !== from) {
+        const next = issues.slice();
+        next.splice(from, 1);
+        next.splice(to, 0, issue);
+        task.issues = next;
+        touchTask(task);
+        pushHistory(task, { kind: "edit", by: "user", note: t("调整问题顺序") });
+      }
       return task;
     },
 
@@ -3417,6 +3564,84 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
         });
       } finally {
         // Every return/throw path must free the shared AI mutex.
+        releaseAiTask();
+      }
+    },
+
+    // On-demand key facts: the scan no longer writes them, so this is the only
+    // path that fills task.keyFacts. One click ≈ one AI budget unit; without a
+    // usable route it falls back to the rules extractor.
+    async "task.facts"(payload) {
+      const task = requireTask(payload);
+      refreshSessionIndex();
+      const targetSessionId = task.primarySessionId || task.sessions?.[0]?.id || "";
+      if (!targetSessionId) throw badRequest("task-has-no-session");
+      const meta = metaForSessionId(targetSessionId);
+      if (!meta || !meta.file) throw badRequest("task-has-no-session");
+      const signal = acquireAiTask();
+      try {
+        const route = resolveAiRoute();
+        const dailyRemaining = dailyAiRemaining();
+        const aiEnabled = state.settings.aiEnabled && route.ok && dailyRemaining > 0;
+        analyzer.resetBudget(aiEnabled ? 1 : 0);
+        let engine = "rules";
+        let aiCalls = 0;
+        let tokens = 0;
+        let model = "";
+        let provider = null;
+        let facts = [];
+        let parsed;
+        try {
+          parsed = source.loadParsed(meta);
+        } catch (error) {
+          throw badRequest(`session-parse-failed: ${String(error?.message || error)}`);
+        }
+        parsed.evidence = source.collectEvidence(parsed);
+        const rules = analyzeSessionRules(parsed, {
+          workspaceTitle: meta.workspaceTitle,
+          workspacePath: meta.workspacePath,
+          maxTasks: state.settings.maxTasksPerSession || 3,
+        });
+        if (aiEnabled) {
+          const digest = source.buildDigest(parsed, {
+            workspaceTitle: meta.workspaceTitle,
+            existingTasks: [],
+            baselineSeq: 0,
+          });
+          const result = await analyzer.facts({ provider: route.provider, model: route.model, digest, signal });
+          if (signal.aborted) throw Object.assign(new Error(t("服务已停止")), { code: "stopped" });
+          if (result.ok) {
+            persistExplicitAiUsage(result);
+            aiCalls += 1;
+            tokens += result.usage?.totalTokens || 0;
+            const normalized = normalizeAnalysis({ title: task.title, keyFacts: result.keyFacts }, parsed, {
+              engine: "llm",
+              model: result.model || route.model,
+            });
+            facts = normalized?.keyFacts || [];
+            if (facts.length) {
+              engine = "llm";
+              model = result.model || route.model;
+              provider = result.provider || route.provider;
+            }
+            applyAiMeta(targetSessionId, meta, { digestBytes: Buffer.byteLength(digest, "utf8") });
+          } else if (result.code !== "aborted" && result.code !== "budget") {
+            logWarn("[super-kanban] task.facts LLM degraded to rules");
+          }
+        }
+        if (!facts.length) facts = rules.tasks?.[0]?.keyFacts || [];
+        return commitState(() => {
+          const current = requireTask(payload);
+          current.keyFacts = facts.slice(0, KEYFACT_LIMIT);
+          pushHistory(current, { kind: "edit", by: "user", note: t("按需提取关键事实") });
+          touchTask(current);
+          truncateTask(current);
+          const message = facts.length
+            ? engine === "llm" ? t("关键事实已更新") : t("AI 不可用，已用规则提取关键事实")
+            : t("没有提取到关键事实");
+          return { task: current, engine, aiCalls, tokens, message, model, provider };
+        });
+      } finally {
         releaseAiTask();
       }
     },
@@ -3922,7 +4147,7 @@ export function createKanbanService({ ctx, aiScanMaxMs, aiCatalogTimeoutMs } = {
         const handler = ops[op];
         try {
           const payload = body.payload && typeof body.payload === "object" ? body.payload : {};
-          const direct = ["task.continuePrompt", "task.analyze", "task.polishPrompt", "backup.preview"].includes(op) || op.startsWith("scan.");
+          const direct = ["task.continuePrompt", "task.analyze", "task.facts", "task.polishPrompt", "backup.preview"].includes(op) || op.startsWith("scan.");
           const data = direct ? await handler(payload) : commitState(() => handler(payload), op.startsWith("task.") ? "task" : "settings");
           const projected = op.startsWith("task.") && data && typeof data === "object"
             ? data.task ? { ...data, task: textProjection.task(data.task) }
